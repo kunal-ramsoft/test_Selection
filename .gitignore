@@ -1,0 +1,29 @@
+# Secrets — never commit
+scripts/.env
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Generated / local run artifacts
+scripts/last_model_response.txt
+scripts/last_stage1_candidates.txt
+scripts/last_stage2_merged_paths.txt
+scripts/last_model_raw_response.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
