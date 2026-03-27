@@ -18,8 +18,8 @@ Behavior:
   - API / transport failure → fall back to all discovered spec files (safe default).
   - last_model_response.txt = final selected paths (one per line, or "(none)"); last_model_raw_response.txt
     = raw assistant text (Stage 2 in --two-stage, full reply in single-shot).
-  - --two-stage: Stage 1 = wide-net candidates from summaries; Stage 2 = final pick (precision-first
-    by default; --stage2-recall = legacy recall Stage 2). last_stage2_merged_paths.txt = merge-only paths.
+  - --two-stage: Stage 1 = wide-net candidates; Stage 2 = final pick (precision default, --stage2-balanced,
+    or --stage2-recall). last_stage2_merged_paths.txt = merge-only paths.
 """
 
 import argparse
@@ -27,7 +27,43 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+
+def log_step(step: str, detail: str = "") -> None:
+    """Print a numbered pipeline step to stderr for debugging (where failures occur)."""
+    if detail:
+        print(f"[select_tests] STEP: {step} — {detail}", file=sys.stderr)
+    else:
+        print(f"[select_tests] STEP: {step}", file=sys.stderr)
+
+
+def _log_azure_api_exception(label: str, e: BaseException) -> None:
+    """Print exception type, message, HTTP status/body when available (OpenAI/Azure errors)."""
+    print(f"[select_tests] STEP ERROR [{label}]: type={type(e).__name__}", file=sys.stderr)
+    print(f"[select_tests] STEP ERROR [{label}]: {e!r}", file=sys.stderr)
+    sc = getattr(e, "status_code", None)
+    if sc is not None:
+        print(f"[select_tests] STEP ERROR [{label}]: HTTP status_code={sc}", file=sys.stderr)
+    body = getattr(e, "body", None)
+    if body is not None:
+        body_s = repr(body)
+        if len(body_s) > 4000:
+            body_s = body_s[:4000] + "..."
+        print(f"[select_tests] STEP ERROR [{label}]: body={body_s}", file=sys.stderr)
+    resp = getattr(e, "response", None)
+    if resp is not None and body is None:
+        txt = getattr(resp, "text", None)
+        if txt:
+            t = txt if len(txt) <= 4000 else txt[:4000] + "..."
+            print(f"[select_tests] STEP ERROR [{label}]: response.text={t!r}", file=sys.stderr)
+    err_obj = getattr(e, "error", None)
+    if err_obj is not None:
+        print(f"[select_tests] STEP ERROR [{label}]: nested error={err_obj!r}", file=sys.stderr)
+    cause = e.__cause__
+    if cause is not None:
+        print(f"[select_tests] STEP ERROR [{label}]: __cause__={cause!r}", file=sys.stderr)
 
 # Load .env from script directory so API key etc. are available without setting env each time
 try:
@@ -155,6 +191,10 @@ def parse_diff_git_paths(diff_text: str) -> list[str]:
 MAX_DIFF_CHARS = 12_000  # Truncate diff to avoid token limits
 # Stage 2: per-spec truncation (same order of magnitude as generate_summaries.py's 8000)
 STAGE2_SPEC_MAX_CHARS = 10_000
+# Stage 2: cap total snippet size across all Stage-1 candidates. Without this, many candidates × 10k
+# chars explodes the prompt (~60k+ tokens) and models like gpt-5-mini often return empty message.content.
+STAGE2_TOTAL_SNIPPET_BUDGET_CHARS_DEFAULT = 100_000
+STAGE2_PER_SPEC_FLOOR_CHARS = 200  # minimum per spec when budget is tight (still truncated)
 
 
 def _default_max_completion_tokens() -> int:
@@ -166,7 +206,31 @@ def _stage1_max_completion_tokens() -> int:
 
 
 def _stage2_max_completion_tokens() -> int:
-    return int(os.environ.get("AZURE_OPENAI_STAGE2_MAX_COMPLETION_TOKENS", "8192"))
+    # Reasoning models charge reasoning_tokens inside completion_tokens; default must leave room
+    # for paths after reasoning (see completion_tokens_details in logs).
+    return int(os.environ.get("AZURE_OPENAI_STAGE2_MAX_COMPLETION_TOKENS", "16384"))
+
+
+def _stage2_total_snippet_budget_chars() -> int:
+    return int(
+        os.environ.get(
+            "STAGE2_MAX_TOTAL_SNIPPET_CHARS",
+            str(STAGE2_TOTAL_SNIPPET_BUDGET_CHARS_DEFAULT),
+        )
+    )
+
+
+def stage2_per_spec_max_chars(num_candidates: int) -> int:
+    """
+    Per-spec char cap for Stage 2 so total snippets stay within STAGE2_MAX_TOTAL_SNIPPET_CHARS.
+    When Stage 1 returns many paths, each spec gets less than STAGE2_SPEC_MAX_CHARS automatically.
+    """
+    if num_candidates <= 0:
+        return STAGE2_SPEC_MAX_CHARS
+    budget = _stage2_total_snippet_budget_chars()
+    per = budget // num_candidates
+    per = max(STAGE2_PER_SPEC_FLOOR_CHARS, per)
+    return min(STAGE2_SPEC_MAX_CHARS, per)
 
 
 def build_prompt(
@@ -329,15 +393,17 @@ def build_stage2_final_prompt(
     full_diff: str | None,
     path_and_snippets: list[tuple[str, str]],
     *,
-    stage2_recall: bool = False,
+    stage2_mode: str = "precision",
 ) -> tuple[str, str]:
     """
     Stage 2 — final selection using changed files, diff, and truncated spec bodies for Stage-1 candidates only.
 
-    Default (stage2_recall=False): **precision** — smallest necessary set tied to this diff.
-    Optional (stage2_recall=True): **recall** — include every candidate that might need to run (legacy behavior).
+    stage2_mode:
+      - ``precision`` — smallest necessary set (default).
+      - ``balanced`` — slightly wider: 2–5 paths when several distinct flows plausibly apply.
+      - ``recall`` — recall-first; keep every plausible candidate (legacy).
     """
-    if stage2_recall:
+    if stage2_mode == "recall":
         system_message = (
             "You are a **final test-selection** assistant for Playwright E2E tests.\n\n"
             "You are given the code change and **truncated contents** of candidate spec files (Stage 1 already "
@@ -352,6 +418,32 @@ def build_stage2_final_prompt(
         closing = (
             "Reply with **only** the paths to run, one per line (exact paths from the --- headers above). "
             "Recall-first: include every candidate that could plausibly need to run for this change."
+        )
+    elif stage2_mode == "balanced":
+        system_message = (
+            "You are a **final test-selection** assistant for Playwright E2E tests.\n\n"
+            "You are given the code change and **truncated contents** of candidate spec files (Stage 1 already "
+            "produced a broad list). Your job is to output a **small** set of tests — **slightly wider** than the "
+            "bare minimum: allow **light** over-inclusion when several Stage-1 candidates cover **different** user "
+            "flows or surfaces for the same product area.\n\n"
+            "**Balanced — modest recall (not full Stage 1 list):**\n"
+            "- Still **omit** candidates that are clearly unrelated to the diff.\n"
+            "- If **multiple** Stage-1 paths sit under the **same product line** (e.g. shared prefix like `Blume/` "
+            "or neighboring folders such as `BlumeHome/`, `BlumeForms/`, `BlumeDocuments/`) and the change is "
+            "**non-trivial** (several changed files, assets, strings, or cross-cutting behavior), prefer **2–5** "
+            "paths that each plausibly exercise a **distinct** flow — do **not** collapse to a single spec by default "
+            "in that situation.\n"
+            "- If **roughly five or more** files appear under Changed files, include **at least two** paths when "
+            "at least two candidates each have a plausible link to the change.\n"
+            "- When the diff clearly touches **only one** narrow behavior, **one** path is enough.\n"
+            "- Do **not** output the entire Stage 1 candidate list unless most lines are genuinely justified.\n\n"
+            "Output **only** paths from the candidate set below (paths before each `---` block), using the **exact** "
+            "path strings. **One path per line.** No explanations, bullets, markdown, or other text. "
+            "If none of the candidates are justified, reply with **no lines** (empty response)."
+        )
+        closing = (
+            "Reply with **only** the paths to run, one per line (exact paths from the --- headers above). "
+            "Balanced: a **small** set with **light** over-inclusion when several distinct flows apply."
         )
     else:
         system_message = (
@@ -425,11 +517,116 @@ def build_stage2_final_prompt(
 # ---------------------------------------------------------------------------
 # Checkpoint 5: Azure OpenAI call for test selection
 # ---------------------------------------------------------------------------
+def _reasoning_tokens_from_usage(usage: object | None) -> int | None:
+    if usage is None:
+        return None
+    ctd = getattr(usage, "completion_tokens_details", None)
+    if ctd is None:
+        return None
+    return getattr(ctd, "reasoning_tokens", None)
+
+
+def _log_chat_completion_diagnostics(
+    label: str,
+    response: object,
+    choice: object,
+    raw_content: str | None,
+    stripped: str,
+) -> None:
+    """Log response metadata to stderr so empty outputs can be diagnosed (usage, finish_reason, etc.)."""
+    usage = getattr(response, "usage", None)
+    usage_s = ""
+    if usage is not None:
+        pt = getattr(usage, "prompt_tokens", None)
+        ct = getattr(usage, "completion_tokens", None)
+        tt = getattr(usage, "total_tokens", None)
+        usage_s = f" prompt_tokens={pt} completion_tokens={ct} total_tokens={tt}"
+        ctd = getattr(usage, "completion_tokens_details", None)
+        if ctd is not None:
+            # e.g. reasoning models: many tokens in details but message.content empty
+            usage_s += f" completion_tokens_details={ctd!r}"
+    rid = getattr(response, "id", None)
+    model = getattr(response, "model", None)
+    finish = getattr(choice, "finish_reason", None)
+    raw_kind = "None" if raw_content is None else f"str(len={len(raw_content)})"
+    print(
+        f"[select_tests] {label}: response_id={rid!r} model={model!r} finish_reason={finish!r}{usage_s}",
+        file=sys.stderr,
+    )
+    print(
+        f"[select_tests] {label}: message.content {raw_kind} stripped_len={len(stripped)}",
+        file=sys.stderr,
+    )
+    if not stripped:
+        refusal = getattr(choice.message, "refusal", None)
+        tool_calls = getattr(choice.message, "tool_calls", None)
+        print(
+            f"[select_tests] {label}: refusal={refusal!r} tool_calls={tool_calls!r}",
+            file=sys.stderr,
+        )
+        if finish == "length":
+            print(
+                f"[select_tests] {label}: Hint: finish_reason=length — output may be truncated; "
+                "raise AZURE_OPENAI_SELECTION_MAX_COMPLETION_TOKENS or STAGE1/STAGE2 token env vars.",
+                file=sys.stderr,
+            )
+        elif finish == "stop" and raw_content is None:
+            print(
+                f"[select_tests] {label}: Hint: content is None with finish_reason=stop — deployment may "
+                "omit text (e.g. reasoning-only field) or hit a limit; retry, change deployment, or reduce prompt size.",
+                file=sys.stderr,
+            )
+        elif finish == "stop" and (raw_content is not None) and not stripped:
+            if raw_content == "":
+                print(
+                    f"[select_tests] {label}: Hint: empty string in message.content — model used "
+                    f"{getattr(usage, 'completion_tokens', None)!r} completion_tokens but no visible text; "
+                    "common with reasoning models (see completion_tokens_details), oversized prompts "
+                    "(raise STAGE2_MAX_TOTAL_SNIPPET_CHARS or narrow Stage 1), or deployment quirks.",
+                    file=sys.stderr,
+                )
+                rt = _reasoning_tokens_from_usage(usage)
+                ct = getattr(usage, "completion_tokens", None)
+                if (
+                    rt is not None
+                    and ct is not None
+                    and isinstance(ct, int)
+                    and ct > 0
+                    and rt >= ct - 50
+                ):
+                    print(
+                        f"[select_tests] {label}: Hint: reasoning_tokens ({rt}) used almost all "
+                        f"completion_tokens ({ct}) — raise AZURE_OPENAI_STAGE2_MAX_COMPLETION_TOKENS "
+                        "(e.g. 32768) so the model can emit text after reasoning, or use a "
+                        "non-reasoning deployment for Stage 2. Optional: STAGE2_FALLBACK_STAGE1=1 uses "
+                        "Stage-1 candidates when Stage 2 is empty.",
+                        file=sys.stderr,
+                    )
+            else:
+                print(
+                    f"[select_tests] {label}: Hint: whitespace-only content — model returned no visible paths.",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"[select_tests] {label}: Hint: empty paths after strip — model may intend 'no tests' "
+                "(see system prompt) or output was unusable.",
+                file=sys.stderr,
+            )
+    if os.environ.get("SELECT_TESTS_VERBOSE_AZURE", "").strip() in ("1", "true", "yes"):
+        if raw_content is not None and not stripped:
+            preview = repr(raw_content)
+            if len(preview) > 500:
+                preview = preview[:500] + "..."
+            print(f"[select_tests] {label}: raw content preview: {preview}", file=sys.stderr)
+
+
 def call_azure_openai_for_selection(
     system_message: str,
     user_message: str,
     *,
     max_completion_tokens: int | None = None,
+    log_label: str = "Azure",
 ) -> str:
     """
     Call Azure OpenAI chat completions with the given messages.
@@ -454,14 +651,26 @@ def call_azure_openai_for_selection(
         sys.exit(1)
 
     try:
-        client = AzureOpenAI(
-            api_key=api_key,
-            azure_endpoint=endpoint.rstrip("/"),
-            api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
-        )
+        timeout_env = os.environ.get("AZURE_OPENAI_TIMEOUT_SECONDS", "").strip()
+        timeout_sec: float | None = float(timeout_env) if timeout_env else None
+
+        _client_kw = {
+            "api_key": api_key,
+            "azure_endpoint": endpoint.rstrip("/"),
+            "api_version": os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+        }
+        if timeout_sec is not None:
+            _client_kw["timeout"] = timeout_sec
+        client = AzureOpenAI(**_client_kw)
         # Large prompts (many specs) + some models (e.g. reasoning) can hit the limit at 1024
         # and return empty content with finish_reason=length.
         max_completion = max_completion_tokens if max_completion_tokens is not None else _default_max_completion_tokens()
+        log_step(
+            f"{log_label} API request starting",
+            f"system={len(system_message)} chars, user={len(user_message)} chars, "
+            f"max_completion_tokens={max_completion}, timeout_sec={timeout_sec!r}, deployment={deployment!r}",
+        )
+        t0 = time.monotonic()
         response = client.chat.completions.create(
             model=deployment,
             messages=[
@@ -470,19 +679,19 @@ def call_azure_openai_for_selection(
             ],
             max_completion_tokens=max_completion,
         )
+        elapsed = time.monotonic() - t0
         choice = response.choices[0]
         raw = choice.message.content
         content = (raw or "").strip()
-        if not content:
-            finish = getattr(choice, "finish_reason", None)
-            refusal = getattr(choice.message, "refusal", None)
-            print(
-                f"[select_tests] Empty model content: finish_reason={finish!r}, refusal={refusal!r}",
-                file=sys.stderr,
-            )
+        log_step(
+            f"{log_label} API request finished OK",
+            f"elapsed={elapsed:.2f}s, stripped_content_len={len(content)}",
+        )
+        _log_chat_completion_diagnostics(log_label, response, choice, raw, content)
         return content
     except Exception as e:
-        raise RuntimeError(f"Azure OpenAI API call failed: {e}") from e
+        _log_azure_api_exception(log_label, e)
+        raise RuntimeError(f"Azure OpenAI API call failed ({log_label}): {e}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -703,10 +912,13 @@ def run_two_stage_flow(
     raw_response_file = scripts_dir / "last_model_raw_response.txt"
     merged_paths_file = scripts_dir / "last_stage2_merged_paths.txt"
 
+    log_step("two-stage flow start", f"changed_files={len(changed_files)}, dry_run={args.dry_run}")
+
     available_tests = get_test_summaries(repo_path)
     print(f"\nTwo-stage: Stage 1 — path + summary for {len(available_tests)} spec(s).")
 
     s1_sys, s1_user = build_stage1_candidate_prompt(changed_files, full_diff, available_tests)
+    log_step("Stage 1 prompt ready", f"system={len(s1_sys)} user={len(s1_user)} chars")
     print(f"\nStage 1 prompt: system={len(s1_sys)} chars, user={len(s1_user)} chars")
     print("Stage 1 user preview (first 400 chars):")
     print(s1_user[:400] + ("..." if len(s1_user) > 400 else ""))
@@ -726,10 +938,12 @@ def run_two_stage_flow(
 
     # --- Stage 1 ---
     try:
+        log_step("Stage 1", "calling Azure OpenAI (wide-net candidates)")
         r1 = call_azure_openai_for_selection(
             s1_sys,
             s1_user,
             max_completion_tokens=_stage1_max_completion_tokens(),
+            log_label="Stage 1",
         )
     except RuntimeError as e:
         print(f"Warning: {e}", file=sys.stderr)
@@ -756,6 +970,10 @@ def run_two_stage_flow(
     print(r1 or "(empty)")
 
     candidates = parse_and_validate_response(r1 or "", allowed_set)
+    log_step(
+        "Stage 1 parse + validate",
+        f"{len(candidates)} path(s) matched allowlist (empty model text or no valid lines → 0)",
+    )
     if not candidates:
         raw_response_file.write_text(
             f"(Stage 1 returned no valid candidate paths — skipping Stage 2)\n{r1 or '(empty)'}",
@@ -772,14 +990,37 @@ def run_two_stage_flow(
         print_playwright_command([])
         return
 
-    stage2_recall = bool(getattr(args, "stage2_recall", False))
+    if args.stage2_recall:
+        stage2_mode = "recall"
+    elif getattr(args, "stage2_balanced", False):
+        stage2_mode = "balanced"
+    else:
+        stage2_mode = "precision"
+    _s2_mode_label = {
+        "precision": "precision-first (default)",
+        "balanced": "balanced (--stage2-balanced: slightly wider than precision)",
+        "recall": "recall-first (--stage2-recall)",
+    }[stage2_mode]
+    print(f"\nStage 2 prompt mode: {_s2_mode_label}", file=sys.stderr)
+
+    s2_cap = stage2_per_spec_max_chars(len(candidates))
+    budget = _stage2_total_snippet_budget_chars()
     print(
-        f"\nStage 2 prompt mode: {'recall-first (--stage2-recall)' if stage2_recall else 'precision-first (default)'}",
+        f"\nStage 2 snippet budget: total={budget} chars across {len(candidates)} candidate(s) "
+        f"→ max {s2_cap} chars/spec (STAGE2_SPEC_MAX_CHARS={STAGE2_SPEC_MAX_CHARS} upper bound).",
         file=sys.stderr,
     )
+    if s2_cap < STAGE2_SPEC_MAX_CHARS:
+        print(
+            "Stage 2: per-spec snippets reduced so the prompt stays smaller — avoids empty model "
+            "replies on very large Stage-2 prompts. Override with STAGE2_MAX_TOTAL_SNIPPET_CHARS in .env.",
+            file=sys.stderr,
+        )
 
-    snippets = get_truncated_spec_snippets(repo_path, candidates)
+    log_step("Stage 2 load spec snippets", f"reading {len(candidates)} candidate file(s) from repo")
+    snippets = get_truncated_spec_snippets(repo_path, candidates, max_chars=s2_cap)
     allowed_stage2 = {p for p, _ in snippets}
+    log_step("Stage 2 snippets loaded", f"{len(snippets)} snippet(s), allowed_stage2={len(allowed_stage2)}")
     if not snippets:
         raw_response_file.write_text(
             "(Stage 2 skipped: no readable spec files for Stage-1 candidates.)",
@@ -796,17 +1037,26 @@ def run_two_stage_flow(
         return
 
     s2_sys, s2_user = build_stage2_final_prompt(
-        changed_files, full_diff, snippets, stage2_recall=stage2_recall
+        changed_files, full_diff, snippets, stage2_mode=stage2_mode
     )
+    log_step("Stage 2 prompt ready", f"system={len(s2_sys)} user={len(s2_user)} chars")
+    if len(s2_user) > 150_000:
+        print(
+            f"\nWarning: Stage 2 user message is very large ({len(s2_user)} chars). "
+            "If the model returns empty content, lower STAGE2_MAX_TOTAL_SNIPPET_CHARS or reduce Stage 1 recall.",
+            file=sys.stderr,
+        )
     print(f"\nStage 2 prompt: system={len(s2_sys)} chars, user={len(s2_user)} chars")
     print("Stage 2 user preview (first 400 chars):")
     print(s2_user[:400] + ("..." if len(s2_user) > 400 else ""))
 
     try:
+        log_step("Stage 2", "calling Azure OpenAI (final path list from snippets)")
         r2 = call_azure_openai_for_selection(
             s2_sys,
             s2_user,
             max_completion_tokens=_stage2_max_completion_tokens(),
+            log_label="Stage 2",
         )
     except RuntimeError as e:
         print(f"Warning: {e}", file=sys.stderr)
@@ -831,9 +1081,14 @@ def run_two_stage_flow(
     print(r2 or "(empty)")
 
     selected_paths = parse_and_validate_response(r2 or "", allowed_stage2)
+    log_step(
+        "Stage 2 parse + validate",
+        f"{len(selected_paths)} path(s) after parse (empty Stage 2 text → 0)",
+    )
 
     boosted: list[str] = []
-    if not stage2_recall:
+    if stage2_mode != "recall":
+        log_step("Stage 2 merge with Stage 1", "path-alignment heuristics")
         selected_paths, boosted = merge_stage2_with_stage1_path_alignment(
             selected_paths,
             candidates,
@@ -841,6 +1096,7 @@ def run_two_stage_flow(
             full_diff,
             allowed_candidates=allowed_stage2,
         )
+        log_step("Stage 2 merge done", f"final count={len(selected_paths)}, boosted={len(boosted)}")
         if boosted:
             print(
                 f"\nMerged {len(boosted)} Stage-1 path(s) (diff/path alignment): {', '.join(boosted)}",
@@ -851,7 +1107,24 @@ def run_two_stage_flow(
         else:
             merged_paths_file.write_text("(none)\n", encoding="utf-8")
     else:
-        merged_paths_file.write_text("(merge skipped: --stage2-recall)\n", encoding="utf-8")
+        merged_paths_file.write_text("(merge skipped: Stage 2 recall mode)\n", encoding="utf-8")
+
+    if (
+        not selected_paths
+        and not (r2 or "").strip()
+        and candidates
+        and os.environ.get("STAGE2_FALLBACK_STAGE1", "").strip().lower() in ("1", "true", "yes")
+    ):
+        selected_paths = [p for p in candidates if p in allowed_stage2]
+        log_step(
+            "STAGE2_FALLBACK_STAGE1",
+            f"using {len(selected_paths)} Stage-1 path(s) because Stage 2 output was empty",
+        )
+        print(
+            f"\nStage 2 empty — STAGE2_FALLBACK_STAGE1: using {len(selected_paths)} path(s) from Stage 1 "
+            "(set STAGE2_FALLBACK_STAGE1=0 to disable).",
+            file=sys.stderr,
+        )
 
     write_final_selected_paths(out_file, selected_paths)
     print(f"\nFinal paths written to: {out_file}", file=sys.stderr)
@@ -874,6 +1147,7 @@ def run_two_stage_flow(
     else:
         for p in selected_paths:
             print(f"  {p}")
+    log_step("two-stage flow complete", f"final selected_paths={len(selected_paths)}")
     print_playwright_command(selected_paths)
 
 
@@ -899,14 +1173,28 @@ def main():
         "--stage2-recall",
         action="store_true",
         help=(
-            "With --two-stage only: use legacy Stage 2 recall-first prompt (keep every plausible candidate). "
-            "Default Stage 2 favors the smallest sufficient set for the diff."
+            "With --two-stage only: Stage 2 recall-first (keep every plausible candidate). "
+            "Mutually exclusive with --stage2-balanced."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-balanced",
+        action="store_true",
+        help=(
+            "With --two-stage only: Stage 2 balanced mode — slightly more tests than precision-default "
+            "(e.g. 2–5 paths when several distinct flows apply). Mutually exclusive with --stage2-recall."
         ),
     )
     args = parser.parse_args()
 
     if args.stage2_recall and not args.two_stage:
         print("Error: --stage2-recall requires --two-stage.", file=sys.stderr)
+        sys.exit(1)
+    if args.stage2_balanced and not args.two_stage:
+        print("Error: --stage2-balanced requires --two-stage.", file=sys.stderr)
+        sys.exit(1)
+    if args.stage2_recall and args.stage2_balanced:
+        print("Error: use only one of --stage2-recall or --stage2-balanced.", file=sys.stderr)
         sys.exit(1)
 
     # Avoid UnicodeEncodeError on Windows (cp1252) when printing summaries with special chars
@@ -937,6 +1225,11 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    log_step(
+        "git diff loaded",
+        f"{len(changed_files)} file(s), diff_len={len(full_diff) if full_diff else 0}",
+    )
+
     # Checkpoint 2: output for verification
     print(f"Discovered {len(playwright_paths)} Playwright spec(s) under Worklist-2/playwright.")
     print("Changed files:")
@@ -963,6 +1256,7 @@ def main():
     except (ValueError, NotADirectoryError) as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+    log_step("available tests loaded", f"approach={args.approach}, count={len(available_tests)}")
     print(f"\nAvailable tests (approach={args.approach}):")
     for path, text in available_tests:
         preview = text[:80] + "..." if len(text) > 80 else text
@@ -970,12 +1264,14 @@ def main():
 
     # Checkpoint 4: build prompt for AI
     system_msg, user_msg = build_prompt(changed_files, full_diff, available_tests)
+    log_step("single-shot prompt built", f"system={len(system_msg)} user={len(user_msg)} chars")
     print(f"\nPrompt built: system={len(system_msg)} chars, user={len(user_msg)} chars")
     print("User message preview (first 400 chars):")
     print(user_msg[:400] + ("..." if len(user_msg) > 400 else ""))
 
     # Checkpoint 5: call Azure OpenAI for test selection
     if args.dry_run:
+        log_step("single-shot", "dry-run — skipping Azure OpenAI")
         print("\n(dry-run: skipping Azure OpenAI call)")
     else:
         _scripts_dir = Path(__file__).resolve().parent
@@ -983,10 +1279,12 @@ def main():
         _raw_file = _scripts_dir / "last_model_raw_response.txt"
         selected_paths: list[str] = []
         try:
+            log_step("single-shot", "calling Azure OpenAI")
             model_response = call_azure_openai_for_selection(
                 system_msg,
                 user_msg,
                 max_completion_tokens=_default_max_completion_tokens(),
+                log_label="single-shot",
             )
         except RuntimeError as e:
             # API / transport failure: safe default is run all tests
@@ -1010,6 +1308,10 @@ def main():
 
             # Successful API: empty or unparseable reply → no tests (not all tests)
             selected_paths = parse_and_validate_response(model_response, allowed_set)
+            log_step(
+                "single-shot parse + validate",
+                f"{len(selected_paths)} path(s) (empty reply or unknown paths → 0)",
+            )
             write_final_selected_paths(_out_file, selected_paths)
             print(f"\nFinal paths written to: {_out_file}", file=sys.stderr)
             if not selected_paths:
@@ -1024,6 +1326,7 @@ def main():
                         file=sys.stderr,
                     )
 
+        log_step("single-shot flow complete", f"final selected_paths={len(selected_paths)}")
         print("\nSelected tests:")
         if not selected_paths:
             print("  (none)")
